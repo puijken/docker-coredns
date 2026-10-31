@@ -2,7 +2,7 @@
 FROM coredns/coredns:latest as coredns
 
 # Stage 2: Build final image
-FROM python:3.14-slim
+FROM python:3.15-slim
 
 LABEL maintainer="puijken"
 LABEL description="CoreDNS with dynamic Docker discovery (A + PTR records)"
