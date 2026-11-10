@@ -11,11 +11,17 @@ LABEL org.opencontainers.image.source="https://github.com/puijken/docker-coredns
 COPY --from=coredns /coredns /usr/local/bin/coredns
 COPY Corefile /Corefile
 COPY scripts/update_hosts.py /scripts/update_hosts.py
+COPY entrypoint.sh /entrypoint.sh
 
-RUN mkdir -p /etc/coredns && chmod +x /scripts/update_hosts.py
+RUN mkdir -p /etc/coredns && chmod +x /scripts/update_hosts.py /entrypoint.sh
 RUN pip install docker
+
+# Without this Python block-buffers stdout when it is not a terminal, and the updater's messages
+# (errors included) sat in a buffer instead of reaching `docker logs`.
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 53/udp
 EXPOSE 53/tcp
 
-CMD ["/bin/sh", "-c", "python3 /scripts/update_hosts.py & exec coredns -conf /Corefile"]
+# Runs the updater and CoreDNS, ends the container when either exits, forwards SIGTERM.
+CMD ["/entrypoint.sh"]

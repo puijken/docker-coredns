@@ -37,6 +37,11 @@ class FakeClient:
         self.containers = FakeContainers(list(containers))
 
 
+class BrokenContainers:
+    def list(self, all=False, ignore_removed=False):  # noqa: A002
+        raise RuntimeError("docker daemon unreachable")
+
+
 fake_docker = types.ModuleType("docker")
 fake_docker.from_env = lambda: FakeClient()
 sys.modules["docker"] = fake_docker
@@ -157,6 +162,102 @@ def check_record_format(failures):
     print("  record format: 'ip<TAB>fqdn shortname' preserved")
 
 
+def check_hosts_file_is_replaced_not_truncated(failures):
+    """The hosts file is swapped in whole, so CoreDNS's 2s reload can never read a partial one.
+
+    Opening the file for writing truncates it first; a reload landing between that and the write
+    served an empty file. A rename shows up as a new inode, an in-place write keeps the old one.
+    """
+    update_hosts.client = FakeClient([FakeContainer("svc", {
+        "macvlan12": {"IPAddress": "10.0.12.70", "IPAMConfig": None},
+    })])
+    workdir = tempfile.mkdtemp()
+    path = os.path.join(workdir, "hosts")
+    with open(path, "w") as f:
+        f.write("192.0.2.1\told.example.test old\n")
+    inode_before = os.stat(path).st_ino
+    original = update_hosts.HOSTS_FILE
+    update_hosts.HOSTS_FILE = path
+    try:
+        update_hosts.generate_hosts()
+        with open(path) as f:
+            body = f.read()
+        leftovers = sorted(set(os.listdir(workdir)) - {"hosts"})
+        inode_after = os.stat(path).st_ino
+    finally:
+        update_hosts.HOSTS_FILE = original
+        for name in os.listdir(workdir):
+            os.unlink(os.path.join(workdir, name))
+        os.rmdir(workdir)
+
+    if "svc" not in body or "old.example.test" in body:
+        failures.append(f"  atomic write: unexpected hosts content {body!r}")
+    elif inode_after == inode_before:
+        failures.append("  atomic write: the hosts file was rewritten in place (same inode); a "
+                        "CoreDNS reload can read it truncated")
+    elif leftovers:
+        failures.append(f"  atomic write: temporary files left behind: {leftovers}")
+    else:
+        print("  atomic write: hosts file replaced by rename, no temporary file left behind")
+
+
+def check_event_burst_is_one_rewrite(failures):
+    """A burst of events costs one rewrite, irrelevant events cost none, a failure is retried."""
+    calls = []
+    saved = (update_hosts.generate_hosts, update_hosts.DEBOUNCE_SECONDS,
+             update_hosts.RETRY_SECONDS, update_hosts.client)
+    update_hosts.generate_hosts = lambda: calls.append(1)
+    update_hosts.DEBOUNCE_SECONDS = 0
+    update_hosts.RETRY_SECONDS = 0
+    flag = update_hosts._update_requested
+    try:
+        # Healthcheck noise must not even request a rewrite (an earlier regression: every
+        # exec_start/exec_die rewrote the file).
+        flag.clear()
+        update_hosts.handle_events([
+            {"Type": "container", "Action": "exec_start: /bin/sh -c healthcheck"},
+            {"Type": "container", "Action": "exec_die"},
+            {"Type": "image", "Action": "pull"},
+        ])
+        if flag.is_set():
+            failures.append("  events: an irrelevant event requested a hosts rewrite")
+            return
+
+        # 40 containers starting at once: one rewrite, and the request is consumed by it.
+        update_hosts.handle_events(
+            [{"Type": "container", "Action": "start"}] * 40
+            + [{"Type": "network", "Action": "connect"}] * 40)
+        if not flag.is_set():
+            failures.append("  events: relevant events did not request a hosts rewrite")
+            return
+        update_hosts.run_pending_update()
+        if len(calls) != 1 or flag.is_set():
+            failures.append(f"  events: a burst of 80 events caused {len(calls)} rewrites "
+                            f"(expected 1), request still pending={flag.is_set()}")
+            return
+
+        # A rewrite that fails must leave the request pending, so it is retried without waiting
+        # for the next Docker event -- and must not kill the worker.
+        update_hosts.generate_hosts = saved[0]
+        update_hosts.client = FakeClient()
+        update_hosts.client.containers = BrokenContainers()
+        flag.set()
+        update_hosts.run_pending_update()
+        if not flag.is_set():
+            failures.append("  events: a failed rewrite was not re-requested (it would wait for "
+                            "the next Docker event to be retried)")
+            return
+    except Exception as e:  # noqa: BLE001 -- any escape here would have killed the worker thread
+        failures.append(f"  events: {type(e).__name__} escaped the update path: {e}")
+        return
+    finally:
+        flag.clear()
+        (update_hosts.generate_hosts, update_hosts.DEBOUNCE_SECONDS,
+         update_hosts.RETRY_SECONDS, update_hosts.client) = saved
+    print("  events: irrelevant ones ignored, a burst of 80 is one rewrite, a failed rewrite is "
+          "retried")
+
+
 def main():
     failures = []
     check_running_uses_runtime_ip(failures)
@@ -164,6 +265,8 @@ def main():
     check_fallback_still_applies(failures)
     check_network_prefix_filter(failures)
     check_record_format(failures)
+    check_hosts_file_is_replaced_not_truncated(failures)
+    check_event_burst_is_one_rewrite(failures)
 
     if failures:
         print(f"\nSMOKE TEST FAILED ({len(failures)}):", file=sys.stderr)
@@ -171,7 +274,7 @@ def main():
         return 1
 
     print("smoke test passed: runtime address, stopped-container fallback, FALLBACK_IP, "
-          "network prefix filter, record format")
+          "network prefix filter, record format, atomic write, event coalescing")
     return 0
 
 

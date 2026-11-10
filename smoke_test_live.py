@@ -10,7 +10,12 @@ Corefile's hosts reload. It answers real DNS queries:
 
   1. a container that existed before startup gets an A and a PTR record;
   2. a container started afterwards gets one through the event listener;
-  3. a stopped container keeps its static address (Docker's real stop semantics, not a fake).
+  3. a stopped container keeps its static address (Docker's real stop semantics, not a fake);
+  4. the updater's output reaches `docker logs` (it used to sit in Python's stdout buffer, which
+     also made the "no error logged" check below pass whatever happened);
+  5. `docker stop` returns promptly and exits 0;
+  6. killing the updater ends the container, instead of CoreDNS serving a hosts file that no
+     longer follows Docker.
 
 Needs a Docker daemon and nothing else -- stdlib only (including the DNS client), and the test
 containers are the image under test itself running `sleep`, so no other image is pulled. The
@@ -117,6 +122,33 @@ def wait_for_answer(port, name, qtype, expected, what, timeout=20):
                        f"within {timeout}s")
 
 
+# Run inside the container: SIGKILL update_hosts.py (the slim image has no pkill).
+KILL_UPDATER = """
+import os, signal
+for pid in filter(str.isdigit, os.listdir('/proc')):
+    try:
+        cmdline = open(f'/proc/{pid}/cmdline', 'rb').read()
+    except OSError:
+        continue
+    # Not this process: its own command line contains the script's path too.
+    if int(pid) != os.getpid() and b'/scripts/update_hosts.py' in cmdline:
+        os.kill(int(pid), signal.SIGKILL)
+"""
+
+
+def is_running(container):
+    return docker("inspect", "-f", "{{.State.Running}}", container) == "true"
+
+
+def wait_for(condition, what, timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if condition():
+            return
+        time.sleep(0.5)
+    raise SmokeFailure(f"timed out after {timeout}s waiting for {what}")
+
+
 def ptr_name(ip):
     return ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
 
@@ -162,10 +194,33 @@ def run(image):
                            f"address [{ip!r}]")
     print("  stopped container: still resolves to its static address")
 
-    if docker("inspect", "-f", "{{.State.Running}}", COREDNS) != "true":
+    if not is_running(COREDNS):
         raise SmokeFailure("coredns container exited")
-    if "Error updating hosts" in logs(COREDNS):
+    if "Updated /etc/coredns/hosts" not in logs(COREDNS):
+        raise SmokeFailure("update_hosts.py's output is not in the container log (buffered?)")
+    if "Error updating hosts" in logs(COREDNS) or "event stream failed" in logs(COREDNS):
         raise SmokeFailure("update_hosts.py logged an error")
+    print("  updater output: visible in the container log, no errors")
+
+    started = time.time()
+    docker("stop", COREDNS)
+    took = time.time() - started
+    code = int(docker("inspect", "-f", "{{.State.ExitCode}}", COREDNS))
+    if took > 5 or code != 0:
+        raise SmokeFailure(f"docker stop took {took:.1f}s and exited {code}, expected a prompt "
+                           f"exit 0")
+    print(f"  docker stop: exited cleanly in {took:.1f}s")
+
+    docker("start", COREDNS)
+    wait_for(lambda: logs(COREDNS).count("Listening for Docker events") >= 2,
+             "the restarted updater to come up")
+    # check=False: the container may be gone before the exec itself has returned.
+    docker("exec", COREDNS, "python3", "-c", KILL_UPDATER, check=False)
+    wait_for(lambda: not is_running(COREDNS), "the container to exit after its updater died")
+    code = int(docker("inspect", "-f", "{{.State.ExitCode}}", COREDNS))
+    if code == 0:
+        raise SmokeFailure("container exited 0 after its updater died")
+    print("  updater killed: the container exited (non-zero) instead of serving a stale file")
 
 
 def main():
@@ -182,7 +237,8 @@ def main():
         docker("rm", "-f", COREDNS, BEFORE[0], AFTER[0], LATE[0], check=False)
         docker("network", "rm", NETWORK, check=False)
 
-    print("smoke test passed: A + PTR, event listener, stopped-container static address")
+    print("smoke test passed: A + PTR, event listener, stopped-container static address, "
+          "updater output, prompt stop, exits when the updater dies")
     return 0
 
 
